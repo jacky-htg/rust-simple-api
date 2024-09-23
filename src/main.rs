@@ -1,170 +1,138 @@
-//import
-use postgres::{ Client, NoTls };
-use postgres::Error as PostgresError;
-use std::net::{ TcpListener, TcpStream };
-use std::io::{ Read, Write };
-use std::env;
+mod users;
+mod libs;
+
+use std::sync::Arc;
+use std::num::NonZeroU32;
+use std::str::FromStr; 
+use std::io::Write; 
+use governor::clock::QuantaClock;
+use governor::state::{InMemoryState, NotKeyed};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio_postgres::{Config, NoTls};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Duration, sleep};
+use tokio::signal;
+use governor::{Quota, RateLimiter};
+use deadpool_postgres::{Manager, Pool};
+use log::{info, error};
+use users::handler::{ create_user, get_user, list_user, edit_user, delete_user };
+use libs::{ get_db_url, NOT_FOUND, CORS_ALLOW_ALL };
 
 #[macro_use]
 extern crate serde_derive;
-//Model: User struct with id, name, email
-#[derive(Serialize, Deserialize)]
-struct User {
-    id: Option<i32>,
-    name: String,
-    email: String,
+
+struct AppState {
+    db_pool: Pool,
+    common_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, QuantaClock>>,
+    hard_limiter: Arc<RateLimiter<NotKeyed, InMemoryState, QuantaClock>>,
 }
-//DATABASE URL
-const DB_URL: &str = env!("DATABASE_URL");
-//constants
-const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n";
-const NOT_FOUND: &str = "HTTP/1.1 404 NOT FOUND\r\n\r\n";
-const INTERNAL_ERROR: &str = "HTTP/1.1 500 INTERNAL ERROR\r\n\r\n";
-//main function
-fn main() {
-    //Set Database
-    if let Err(_) = set_database() {
-        println!("Error setting database");
-        return;
-    }
+
+#[tokio::main]
+async fn main() {
+    // Setup database connection pool once and share it across handlers
+    let db_url = get_db_url();
+    let cfg = Config::from_str(&db_url).expect("Failed to parse DATABASE_URL");
+    let manager = Manager::new(cfg, NoTls);
+    let pool = Pool::new(manager, 16); // 16 adalah ukuran maksimum pool
+
+    env_logger::Builder::new()
+        .format(|buf: &mut env_logger::fmt::Formatter, record| {
+            writeln!(buf, "[{}] {}:{} - {}: {}", 
+                 buf.timestamp(),
+                 record.file().unwrap_or("<unknown>"),
+                 record.line().unwrap_or(0),
+                 record.level(),
+                 record.args())
+        })
+        .init();
+
     //start server and print port
-    let listener = TcpListener::bind(format!("0.0.0.0:8080")).unwrap();
-    println!("Server listening on port 8080");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                handle_client(stream);
-            }
-            Err(e) => {
-                println!("Unable to connect: {}", e);
-            }
+    let listener = TcpListener::bind("0.0.0.0:8080").await.expect("Failed to bind to address 0.0.0.0:8080");
+    let semaphore = Arc::new(Semaphore::new(10));
+    let global_limiter = Arc::new(RateLimiter::direct(Quota::per_second(NonZeroU32::new(200).unwrap())));
+    let common_limiter = Arc::new(RateLimiter::direct(Quota::per_second(NonZeroU32::new(100).unwrap())));
+    let hard_limiter = Arc::new(RateLimiter::direct(Quota::per_second(NonZeroU32::new(100).unwrap())));
+    info!("Server listening on port 8080");
+
+    // Share AppState with all incoming connections
+    let app_state = Arc::new(AppState {
+        db_pool: pool,
+        common_limiter: common_limiter.clone(),
+        hard_limiter: hard_limiter.clone(),
+    });
+    
+    let shutdown_signal = signal::ctrl_c(); 
+
+    let server_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("Failed to accept connection");
+            let permit = semaphore.clone().acquire_owned().await.expect("Failed to acquire semaphore permit"); 
+            let state = app_state.clone();
+            let global_limiter = global_limiter.clone();
+                
+            tokio::spawn(async move {
+                loop {
+                    match global_limiter.check() {
+                        Ok(()) => {
+                            handle_client(&mut stream, state).await; 
+                            break;
+                        },
+                        Err(_) => sleep(Duration::from_millis(100)).await
+                    }                
+                }
+                drop(permit);
+            });
         }
-    }
+    });
+    let _ = shutdown_signal.await;
+    println!("Shutting down gracefully...");
+    server_task.abort(); 
 }
-//handle requests
-fn handle_client(mut stream: TcpStream) {
+
+async fn handle_client(stream: &mut tokio::net::TcpStream, state: Arc<AppState>) {
     let mut buffer = [0; 1024];
     let mut request = String::new();
-    match stream.read(&mut buffer) {
+    match stream.read(&mut buffer).await {
         Ok(size) => {
             request.push_str(String::from_utf8_lossy(&buffer[..size]).as_ref());
+            let mut client = state.db_pool.get().await.expect("Failed to get a database connection from the pool");
             let (status_line, content) = match &*request {
-                r if r.starts_with("POST /users") => handle_post_request(r),
-                r if r.starts_with("GET /users/") => handle_get_request(r),
-                r if r.starts_with("GET /users") => handle_get_all_request(r),
-                r if r.starts_with("PUT /users/") => handle_put_request(r),
-                r if r.starts_with("DELETE /users/") => handle_delete_request(r),
+                r if r.starts_with("OPTIONS") => (CORS_ALLOW_ALL.to_string(),"".to_string()),
+                r if r.starts_with("POST /users") => {
+                    match state.hard_limiter.check() {
+                        Ok(()) => create_user::handle(r, &mut client).await,
+                        Err(_) => {
+                            error!("429 Too Many Requests");
+                            (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
+                        }
+                    }
+                },
+                r if r.starts_with("GET /users/") => get_user::handle(r, &client).await,
+                r if r.starts_with("GET /users") => list_user::handle(r, &client).await,
+                r if r.starts_with("PUT /users/") => {
+                    match state.common_limiter.check() {
+                        Ok(()) => edit_user::handle(r, &client).await,
+                        Err(_) => {
+                            error!("429 Too Many Requests");
+                            (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
+                        }
+                        
+                    }
+                },
+                r if r.starts_with("DELETE /users/") => {
+                    match state.common_limiter.check() {
+                        Ok(()) => delete_user::handle(r, &client).await,
+                        Err(_) => {
+                            error!("429 Too Many Requests");
+                            (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
+                        }
+                    }
+                }
                 _ => (NOT_FOUND.to_string(), "404 not found".to_string()),
             };
-            stream.write_all(format!("{}{}", status_line, content).as_bytes()).unwrap();
+            stream.write_all(format!("{}{}", status_line, content).as_bytes()).await.expect("Failed to write response to stream");
         }
         Err(e) => eprintln!("Unable to read stream: {}", e),
     }
-}
-//handle post request
-fn handle_post_request(request: &str) -> (String, String) {
-    match (get_user_request_body(&request), Client::connect(DB_URL, NoTls)) {
-        (Ok(user), Ok(mut client)) => {
-            client
-                .execute(
-                    "INSERT INTO users (name, email) VALUES ($1, $2)",
-                    &[&user.name, &user.email]
-                )
-                .unwrap();
-            (OK_RESPONSE.to_string(), "User created".to_string())
-        }
-        _ => (INTERNAL_ERROR.to_string(), "Internal error".to_string()),
-    }
-}
-//handle get request
-fn handle_get_request(request: &str) -> (String, String) {
-    match (get_id(&request).parse::<i32>(), Client::connect(DB_URL, NoTls)) {
-        (Ok(id), Ok(mut client)) =>
-            match client.query_one("SELECT * FROM users WHERE id = $1", &[&id]) {
-                Ok(row) => {
-                    let user = User {
-                        id: row.get(0),
-                        name: row.get(1),
-                        email: row.get(2),
-                    };
-                    (OK_RESPONSE.to_string(), serde_json::to_string(&user).unwrap())
-                }
-                _ => (NOT_FOUND.to_string(), "User not found".to_string()),
-            }
-        _ => (INTERNAL_ERROR.to_string(), "Internal error".to_string()),
-    }
-}
-//handle get all request
-fn handle_get_all_request(_request: &str) -> (String, String) {
-    match Client::connect(DB_URL, NoTls) {
-        Ok(mut client) => {
-            let mut users = Vec::new();
-            for row in client.query("SELECT id, name, email FROM users", &[]).unwrap() {
-                users.push(User {
-                    id: row.get(0),
-                    name: row.get(1),
-                    email: row.get(2),
-                });
-            }
-            (OK_RESPONSE.to_string(), serde_json::to_string(&users).unwrap())
-        }
-        _ => (INTERNAL_ERROR.to_string(), "Internal error".to_string()),
-    }
-}
-//handle put request
-fn handle_put_request(request: &str) -> (String, String) {
-    match
-        (
-            get_id(&request).parse::<i32>(),
-            get_user_request_body(&request),
-            Client::connect(DB_URL, NoTls),
-        )
-    {
-        (Ok(id), Ok(user), Ok(mut client)) => {
-            client
-                .execute(
-                    "UPDATE users SET name = $1, email = $2 WHERE id = $3",
-                    &[&user.name, &user.email, &id]
-                )
-                .unwrap();
-            (OK_RESPONSE.to_string(), "User updated".to_string())
-        }
-        _ => (INTERNAL_ERROR.to_string(), "Internal error".to_string()),
-    }
-}
-//handle delete request
-fn handle_delete_request(request: &str) -> (String, String) {
-    match (get_id(&request).parse::<i32>(), Client::connect(DB_URL, NoTls)) {
-        (Ok(id), Ok(mut client)) => {
-            let rows_affected = client.execute("DELETE FROM users WHERE id = $1", &[&id]).unwrap();
-            //if rows affected is 0, user not found
-            if rows_affected == 0 {
-                return (NOT_FOUND.to_string(), "User not found".to_string());
-            }
-            (OK_RESPONSE.to_string(), "User deleted".to_string())
-        }
-        _ => (INTERNAL_ERROR.to_string(), "Internal error".to_string()),
-    }
-}
-//db setup
-fn set_database() -> Result<(), PostgresError> {
-    let mut client = Client::connect(DB_URL, NoTls)?;
-    client.batch_execute(
-        "
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            name VARCHAR NOT NULL,
-            email VARCHAR NOT NULL
-        )
-    "
-    )?;
-    Ok(())
-}
-//Get id from request URL
-fn get_id(request: &str) -> &str {
-    request.split("/").nth(2).unwrap_or_default().split_whitespace().next().unwrap_or_default()
-}
-//deserialize user from request body without id
-fn get_user_request_body(request: &str) -> Result<User, serde_json::Error> {
-    serde_json::from_str(request.split("\r\n\r\n").last().unwrap_or_default())
 }
