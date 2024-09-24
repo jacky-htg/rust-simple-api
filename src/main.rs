@@ -1,4 +1,5 @@
 mod users;
+mod auth;
 mod libs;
 
 use std::sync::Arc;
@@ -15,9 +16,11 @@ use tokio::time::{Duration, sleep};
 use tokio::signal;
 use governor::{Quota, RateLimiter};
 use deadpool_postgres::{Manager, Pool};
-use log::{info, error};
+use log::{info, error, debug};
 use users::handler::{ create_user, get_user, list_user, edit_user, delete_user };
-use libs::{ get_db_url, NOT_FOUND, CORS_ALLOW_ALL };
+use auth::handler::login_user;
+use libs::{ get_db_url, authenticate, NOT_FOUND, CORS_ALLOW_ALL, TOO_MANY_REQUEST, UNAUTHORIZED };
+
 
 #[macro_use]
 extern crate serde_derive;
@@ -37,6 +40,7 @@ async fn main() {
     let pool = Pool::new(manager, 16); // 16 adalah ukuran maksimum pool
 
     env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)  
         .format(|buf: &mut env_logger::fmt::Formatter, record| {
             writeln!(buf, "[{}] {}:{} - {}: {}", 
                  buf.timestamp(),
@@ -100,11 +104,17 @@ async fn handle_client(stream: &mut tokio::net::TcpStream, state: Arc<AppState>)
             let (status_line, content) = match &*request {
                 r if r.starts_with("OPTIONS") => (CORS_ALLOW_ALL.to_string(),"".to_string()),
                 r if r.starts_with("POST /users") => {
-                    match state.hard_limiter.check() {
-                        Ok(()) => create_user::handle(r, &mut client).await,
+                    match authenticate(&request).await {
+                        Ok(_email) => {
+                            debug!("email {} authenticated", _email);
+                            match state.hard_limiter.check() {
+                                Ok(()) => create_user::handle(r, &mut client).await,
+                                Err(_) => (TOO_MANY_REQUEST.to_string(), "Too Many Requests".to_string())
+                            }
+                        }
                         Err(_) => {
-                            error!("429 Too Many Requests");
-                            (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
+                            error!("Unauthorized access");
+                            (UNAUTHORIZED.to_string(), "Unauthorized".to_string())
                         }
                     }
                 },
@@ -128,7 +138,16 @@ async fn handle_client(stream: &mut tokio::net::TcpStream, state: Arc<AppState>)
                             (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
                         }
                     }
-                }
+                },
+                r if r.starts_with("POST /login") => {
+                    match state.hard_limiter.check() {
+                        Ok(()) => login_user::handle(r, &client).await,
+                        Err(_) => {
+                            error!("429 Too Many Requests");
+                            (NOT_FOUND.to_string(), "429 Too Many Requests".to_string())
+                        }   
+                    }
+                },
                 _ => (NOT_FOUND.to_string(), "404 not found".to_string()),
             };
             stream.write_all(format!("{}{}", status_line, content).as_bytes()).await.expect("Failed to write response to stream");

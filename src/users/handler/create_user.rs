@@ -17,7 +17,7 @@ pub async fn handle(request: &str, db: &mut Client) -> (String, String) {
                 
             }
             
-            let hash_password =match bcrypt::hash(user.password.clone(), bcrypt::DEFAULT_COST) {
+            let hash_password = match bcrypt::hash(user.password.clone(), bcrypt::DEFAULT_COST) {
                 Ok(hash_password) => hash_password,
                 Err(e) => {
                     error!("Error hashing password: {:?}", e);

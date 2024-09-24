@@ -28,6 +28,11 @@ pub async fn get_user_by_id(id: &i32, db: &Client) -> Result<User, Error>{
     })
 }
 
+pub async fn get_password_by_email(email: &str, db: &Client) -> Result<String, Error>{  
+    let row = db.query_one("SELECT password FROM users WHERE email = $1", &[&email]).await?;
+    Ok(row.get(0))
+}
+
 pub async fn is_email_exist(email: &str, db: &Client) -> Result<bool, Error>{  
     let row = db.query_opt("SELECT 1 FROM users WHERE email = $1", &[&email]).await?;
     Ok(row.is_some())
