@@ -1,6 +1,6 @@
 pub mod token;
+use anyhow::{Error, Result};
 use std::env;
-use anyhow::{Result, Error};
 
 pub const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n";
 pub const NOT_FOUND: &str = "HTTP/1.1 404 NOT FOUND\r\n\r\n";
@@ -13,11 +13,24 @@ pub const CORS_ALLOW_ALL: &str = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin
 
 //Get id from request URL
 pub fn get_id(request: &str) -> &str {
-    request.split("/").nth(2).unwrap_or_default().split_whitespace().next().unwrap_or_default()
+    request
+        .split("/")
+        .nth(2)
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
 }
 
 pub fn get_db_url() -> String {
     env::var("DATABASE_URL").expect("DATABASE_URL must be set")
+}
+
+pub fn get_worker_num() -> usize {
+    env::var("WORKER_NUM")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .expect("WORKER_NUM must be a number")
 }
 
 pub async fn authenticate(request: &str) -> Result<String, Error> {
@@ -30,6 +43,4 @@ pub async fn authenticate(request: &str) -> Result<String, Error> {
         Ok(email) => Ok(email),
         Err(e) => Err(anyhow::Error::msg(e.to_string())), // Ubah ke tipe error yang mendukung Send + Sync
     }
-    
 }
-
